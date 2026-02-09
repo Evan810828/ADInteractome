@@ -1,0 +1,20 @@
+{
+    "RASGRF2-DLG2": {
+        "accuracy difference": -1.1970074812967582
+    },
+    "DLG2-CACNG3": {
+        "accuracy difference": 0.7481296758104676
+    },
+    "CAMK2A-DLG2": {
+        "accuracy difference": -0.4488778054862905
+    },
+    "DLG2-SNAP25": {
+        "accuracy difference": 0.8977556109725668
+    },
+    "GRIN1-DLG2": {
+        "accuracy difference": 1.695760598503739
+    },
+    "CAMK2B-DLG2": {
+        "accuracy difference": 0.3491271820448816
+    }
+}

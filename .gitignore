@@ -1,0 +1,83 @@
+# Datasets and data files (top-level only)
+/data/
+*.h5ad
+*.pickle
+*.pkl
+
+# Weights & Biases
+wandb/
+
+# Configuration (use config.example.json as template)
+config.json
+
+# Score maps
+feature/score_maps/
+scFoundation/score_maps/
+scGPT/*pkl
+ranking_gpu_version.json
+co-expression/score_maps/
+
+# Evaluation generated outputs
+evaluation/data/GSEA_result/
+evaluation/data/NES_results/
+evaluation/data/input/
+evaluation/data/output/
+evaluation/data/plots/
+evaluation/accuracy/
+evaluation/data/cell_type_data.csv
+evaluation/data/sample_res.csv
+evaluation/data/sample_test.csv
+evaluation/transformer_results.csv
+
+# Ranking lists
+feature/ranking_lists/
+co-expression/rankings/
+
+# Binary files
+*.bin
+
+# Logs
+scGPT/save/
+*.log
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Model checkpoints
+output_models/
+go_term/save_model/
+go_term/*.pth
+go_term/*.pt
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+venv/
+
+# Archives
+*.zip
+*.tar.gz
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

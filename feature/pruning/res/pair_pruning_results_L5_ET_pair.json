@@ -1,0 +1,29 @@
+{
+    "GRIA1-DLG2": {
+        "accuracy difference": 1.127819548872182
+    },
+    "GRIA2-DLG2": {
+        "accuracy difference": 0.0
+    },
+    "CAMK2B-DLG2": {
+        "accuracy difference": 1.127819548872182
+    },
+    "DLG2-CACNG3": {
+        "accuracy difference": 1.127819548872182
+    },
+    "DLG2-SNAP25": {
+        "accuracy difference": 1.127819548872182
+    },
+    "CAMK2G-DLG2": {
+        "accuracy difference": 0.0
+    },
+    "DLG2-GRIA3": {
+        "accuracy difference": 3.0075187969924855
+    },
+    "CAMK2A-DLG2": {
+        "accuracy difference": 0.3759398496240607
+    },
+    "GRIN1-DLG2": {
+        "accuracy difference": 1.5037593984962427
+    }
+}
