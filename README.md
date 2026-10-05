@@ -1,6 +1,6 @@
-# Gene-Interact
+# ADInteractome
 
-Discovering gene-gene interactions from single-cell RNA-seq data using transformer attention mechanisms for Alzheimer's Disease (AD) classification.
+Official codes for "ADInteractome: Discovering Alzheimer's Disease-Associated Gene Interactions from Single Nucleus RNA-seq Data through Neural Interaction States". Discovering gene-gene interactions from single-cell RNA-seq data using transformer attention mechanisms for Alzheimer's Disease (AD) classification.
 
 ## Overview
 
