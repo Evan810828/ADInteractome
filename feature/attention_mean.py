@@ -19,15 +19,14 @@ import pickle
 import argparse
 import json
 import scanpy as sc
-import gc
+import math
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import hdf5plugin
 
-from transformer.celluformer import CelluFormer
 from transformer.dataset import VariableLengthSequenceDataset
-from transformer.SeqLength_sampling_dataset import SeqLengthScore
-from utils import setup_seed, load_checkpoint, compute_selfattention
+from utils import setup_seed, load_checkpoint
 
 
 def load_data(data_path):
@@ -39,17 +38,22 @@ def load_data(data_path):
     label_mapping = {'Not AD': 0, 'High': 1}
     y_encoded = y_filtered.map(label_mapping)
     
-    # # weighted sampling
-    # dataset = SeqLengthScore(X_filtered, y_encoded, 1e3)
-    
-    # normal
     dataset = VariableLengthSequenceDataset(X_filtered, y_encoded)
     
     return dataset
 
 
+def compute_selfattention(encoder, x, layer, d_model, num_heads, logit_scale):
+    """Use the QKV layout and optional logit multiplier of the reference script."""
+    attention = encoder.layers[layer].self_attn
+    h = F.linear(x, attention.in_proj_weight, bias=attention.in_proj_bias)
+    qkv = h.reshape(x.shape[0], x.shape[1], num_heads, 3 * d_model // num_heads)
+    q, k, _ = qkv.permute(0, 2, 1, 3).chunk(3, dim=-1)
+    return F.softmax((q @ k.transpose(-2, -1)) * logit_scale / math.sqrt(q.size(-1)), dim=-1)
+
+
 def compute_rank(model, dataset, config, args):
-    """Compute gene-gene interaction score maps by averaging attention across samples."""
+    """Restore the aggregation in temp.py, including its padding and smoothing rules."""
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
     
     model = model.to(args.device)
@@ -57,33 +61,45 @@ def compute_rank(model, dataset, config, args):
     score_map = torch.zeros((config['num_genes'], config['num_genes'])).to(args.device)
     frequency_map = torch.zeros((config['num_genes'], config['num_genes'])).to(args.device)
     
-    iterator = iter(dataloader)
-    for i in tqdm(range(len(dataloader)), desc="Computing rank"):
-        seq, vals, _ = next(iterator)
+    for seq, vals, _ in tqdm(dataloader, desc="Computing rank"):
         
         seq = seq.to(args.device) - 1
         vals = vals.to(args.device)
         
         E_attn = torch.zeros((seq.shape[1], seq.shape[1])).to(args.device)
         
-        embedded_X = model.emb(seq)
-        embedded_X = embedded_X * vals.unsqueeze(2)
-        
-        # extract self-attention maps
-        num_layers = transformer_encoder.num_layers
-        d_model = transformer_encoder.layers[0].self_attn.embed_dim
-        num_heads = transformer_encoder.layers[0].self_attn.num_heads
-        norm_first = transformer_encoder.layers[0].norm_first
         with torch.no_grad():
+            embedded_X = model.emb(seq) * vals.unsqueeze(2)
+            num_layers = transformer_encoder.num_layers
+            d_model = transformer_encoder.layers[0].self_attn.embed_dim
+            num_heads = transformer_encoder.layers[0].self_attn.num_heads
+            norm_first = transformer_encoder.layers[0].norm_first
             for i in range(num_layers):
-                # compute attention of layer i
                 h = embedded_X.clone()
                 if norm_first:
                     h = transformer_encoder.layers[i].norm1(h)
-                attn_probs = compute_selfattention(transformer_encoder, h, i, d_model, num_heads)
-                
-                gc.collect()
-                torch.cuda.empty_cache()
+                attn_probs = compute_selfattention(
+                    transformer_encoder, h, i, d_model, num_heads, args.logit_scale
+                )
+                E_attn += attn_probs.sum(dim=1)[0]
+
+            E_attn /= num_layers * num_heads
+
+            # Match the reference scatter operation: each distinct source row
+            # receives the same column-summed attention; repeated indices in
+            # the padded sequence contribute repeatedly to destination columns.
+            index_map = torch.zeros((config['num_genes'], seq.shape[1]), device=args.device)
+            index_map[seq[0]] = seq[0].float()
+            value_map = torch.zeros_like(index_map)
+            value_map[seq[0], :] = E_attn.sum(0).float()
+            score_map.scatter_add_(1, index_map.long(), value_map)
+
+            value_map.zero_()
+            value_map[seq[0], :] = 1.0
+            frequency_map.scatter_add_(1, index_map.long(), value_map)
+            frequency_map += 1e-5
+
+    return (score_map / frequency_map).cpu().numpy()
 
 
 if __name__ == '__main__':
@@ -93,6 +109,8 @@ if __name__ == '__main__':
     parser.add_argument("--data", type=str, default="data/split_train/cell_type_Lamp5_Lhx6.h5ad", help="Path to the data file")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run the model on")
     parser.add_argument("--output", type=str, default="feature/score_maps/adjust/score_map_cell_type_Lamp5_Lhx6_adjusted.pkl", help="Path to the output file")
+    parser.add_argument("--logit_scale", type=float, choices=[1.0, 1000.0], default=1000.0,
+                        help="Attention-logit multiplier: 1000 follows temp.py; 1 follows utils.py")
     args = parser.parse_args()
     
     setup_seed(42)
@@ -110,5 +128,6 @@ if __name__ == '__main__':
     score_map = compute_rank(model, dataset, config, args)
     
     # save the score map
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, 'wb') as f:
         pickle.dump(score_map, f)

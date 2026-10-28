@@ -1,22 +1,12 @@
+"""Rank gene pairs by the trained MLP's weight-based interaction score."""
+
 import argparse
-import torch
+from pathlib import Path
+
 import numpy as np
-from tqdm import tqdm
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-import os
 import pandas as pd
-import hdf5plugin
-import scanpy as sc
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
-
-
-names_path = "data/split_train/cell_type_L5_ET.h5ad"
-data_cell = sc.read_h5ad(names_path)
-filtered_data = data_cell[data_cell.obs['Overall AD neuropathological Change'].isin(['Not AD', 'High'])]
-
-names = pd.DataFrame(filtered_data.var)
+import torch
+from tqdm import tqdm
 
 
 def preprocess_weights(weights):
@@ -24,100 +14,116 @@ def preprocess_weights(weights):
     w_input = torch.abs(weights[0])
     for i in range(len(weights) - 2, 0, -1):
         w_later = torch.matmul(w_later, torch.abs(weights[i]))
-
     return w_input, w_later
 
 
-class CalID(torch.nn.Module):
-    def __init__(self, w_later) -> None:
-        super().__init__()
-        self.w_later = torch.nn.Parameter(w_later)
-
-    def forward(self, batch_w_input):
-        batch_w_input_min = torch.min(batch_w_input, dim=1).values
-        before_agg_strength = torch.matmul(batch_w_input_min, self.w_later)
-        # NOTE for Yuntao:
-        # here we explicitly select the column 1 and only use it for calculate the strength.
-        # In this way, all other classes are disabled.
-        col_to_be_selected = [1]
-        before_agg_strength = before_agg_strength[:, col_to_be_selected]
-        strength = before_agg_strength.sum(dim=-1)
-        return strength
+def top_indices(scores, pairs, k):
+    """Keep highest scores, breaking ties by ascending gene-index pair."""
+    if len(scores) <= k:
+        return np.arange(len(scores))
+    threshold = np.partition(scores, len(scores) - k)[len(scores) - k]
+    above = np.flatnonzero(scores > threshold)
+    tied = np.flatnonzero(scores == threshold)
+    needed = k - len(above)
+    if needed < len(tied):
+        tied = tied[np.argpartition(pairs[tied], needed - 1)[:needed]]
+    return np.concatenate((above, tied))
 
 
-class GeneDataset(Dataset):
-    def __init__(self, w_input) -> None:
-        super(GeneDataset, self).__init__()
-        self.w_input = w_input
-        # self.pair_indices = torch.combinations(range(w_input.shape[0]), 2)
-        candi_nums = w_input.shape[0]
-        self.pair_indices = torch.combinations(torch.arange(start=0, end=candi_nums, dtype=torch.long), 2)
-        
+def pair_batches(n_genes, batch_size):
+    """Enumerate i < j in input gene order without materializing all pairs."""
+    first, second, count = [], [], 0
+    for i in range(n_genes - 1):
+        start = i + 1
+        while start < n_genes:
+            take = min(batch_size - count, n_genes - start)
+            first.append(np.full(take, i, dtype=np.int64))
+            second.append(np.arange(start, start + take, dtype=np.int64))
+            count += take
+            start += take
+            if count == batch_size:
+                yield np.concatenate(first), np.concatenate(second)
+                first, second, count = [], [], 0
+    if count:
+        yield np.concatenate(first), np.concatenate(second)
 
-    def __getitem__(self, index):
-        pair_indices = self.pair_indices[index]
-        return pair_indices, self.w_input[pair_indices]
 
-    def __len__(self):
-        return len(self.pair_indices)
+def interpret_pairwise_interactions(w_input, w_later, names, batch_size=8192,
+                                    top_k=200000, device='cuda:0', merge_size=1000000):
+    # Preserve the original half-precision min(first-layer weights) and
+    # matrix multiplication with class-1 downstream absolute weights.
+    w_input = w_input.T.half().to(device)
+    w_later = w_later.T.half().to(device)
+    n_genes = w_input.shape[0]
+    if len(names) != n_genes or w_later.shape[1] < 2:
+        raise ValueError('Gene count or output class count does not match checkpoint')
+    if batch_size < 1 or top_k < 1 or merge_size < 1:
+        raise ValueError('batch_size, top_k, and merge_size must be positive')
+    kept_scores = np.empty(0, dtype=np.float16)
+    kept_pairs = np.empty(0, dtype=np.int64)
+    pending_scores, pending_pairs, pending_count = [], [], 0
 
+    def merge():
+        nonlocal kept_scores, kept_pairs, pending_scores, pending_pairs, pending_count
+        scores = np.concatenate([kept_scores, *pending_scores])
+        pairs = np.concatenate([kept_pairs, *pending_pairs])
+        if not np.isfinite(scores).all():
+            raise ValueError('Interaction scores contain non-finite values')
+        chosen = top_indices(scores, pairs, top_k)
+        kept_scores, kept_pairs = scores[chosen], pairs[chosen]
+        pending_scores, pending_pairs, pending_count = [], [], 0
 
-def interpret_pairwise_interactions(w_input, w_later, per_device_batch_size):
-    interaction_ranking = pd.DataFrame(columns=['gene1', 'gene2', 'avg_score'])
-    device = torch.device("cuda:0")
-    # w_input.shape : #input_feats x #embed_dim
-    # w_later.shape : #embed_dim x #classes
-    w_input, w_later = w_input.T.half(), w_later.T.half()
-    dataset = GeneDataset(w_input)
-    batch_size = per_device_batch_size * torch.cuda.device_count()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    id_module = CalID(w_later)
-    id_module = id_module.to(device)
-    if torch.cuda.device_count() > 1:
-        id_module = torch.nn.DataParallel(id_module)
-        # disable cuda:2
-        
-        print("Using DataParallel:", torch.cuda.device_count())
-    
-    temp_data = []
-    for indices, batch_w_input in tqdm(loader):
-        # batch_w_input.shape: batch_size x 2 x D, 2 represents the ``pair'' information.
-        batch_w_input = batch_w_input.to(device)
-        w_later = w_later.to(device)
-        strength = id_module(batch_w_input)
-        strength = strength.cpu().tolist()
-        # convert the indices to gene names
-        gene1 = names.iloc[indices[:, 0].tolist()]['gene_ids'].tolist()
-        gene2 = names.iloc[indices[:, 1].tolist()]['gene_ids'].tolist()     
-        temp_data.append(pd.DataFrame({'gene1': gene1, 'gene2': gene2, 'avg_score': strength}))
-
-    interaction_ranking = pd.concat(temp_data, ignore_index=True)
-    interaction_ranking.sort_values('avg_score', ascending=False, inplace=True)
-    
-    # take the first 200000 pairs
-    interaction_ranking = interaction_ranking.head(200000)
-    return interaction_ranking
+    total = n_genes * (n_genes - 1) // 2
+    with torch.no_grad():
+        for i, j in tqdm(pair_batches(n_genes, batch_size), total=(total + batch_size - 1) // batch_size):
+            ti = torch.from_numpy(i).to(device)
+            tj = torch.from_numpy(j).to(device)
+            pair_min = torch.minimum(w_input[ti], w_input[tj])
+            scores = torch.matmul(pair_min, w_later)[:, 1].cpu().numpy()
+            pending_scores.append(scores)
+            pending_pairs.append(i * n_genes + j)
+            pending_count += len(i)
+            if pending_count >= merge_size:
+                merge()
+    if pending_count:
+        merge()
+    order = np.lexsort((kept_pairs, -kept_scores.astype(np.float32)))
+    pairs = kept_pairs[order]
+    symbols = np.asarray(names, dtype=object)
+    return pd.DataFrame({'gene1': symbols[pairs // n_genes],
+                         'gene2': symbols[pairs % n_genes],
+                         'avg_score': kept_scores[order].astype(np.float32)})
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cell_type', required=True)
-    
+    parser.add_argument('--data', type=Path, required=True, help='h5ad used for MLP training; var index is gene symbols')
+    parser.add_argument('--model_path', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--batch_size', type=int, default=8192)
+    parser.add_argument('--top_k', type=int, default=200000)
     args = parser.parse_args()
-    print(f"Running task for cell type: {args.cell_type}")
-    model_path = f"output_models/MLP/{args.cell_type}/mlp_epoch_9.pth"
-    model = torch.load(model_path, map_location='cpu')
-    weights = []
-    for k, v in model.items():
-        if k.endswith('weight'):
-            # we do not need bias
-            # print(k)
-            # print(v.shape)
-            weights.append(v)
+
+    import hdf5plugin  # Register compression filters before opening the h5ad.
+    import scanpy as sc
+    data = sc.read_h5ad(args.data, backed='r')
+    try:
+        names = data.var_names.to_numpy().copy()
+    finally:
+        data.file.close()
+    if pd.Index(names).has_duplicates or pd.isna(names).any():
+        raise ValueError('Gene symbols must be unique and nonmissing')
+    model = torch.load(args.model_path, map_location='cpu', weights_only=True)
+    weights = [v for k, v in model.items() if k.endswith('weight')]
+    if len(weights) < 2:
+        raise ValueError('Expected at least two weight matrices in checkpoint')
     w_input, w_later = preprocess_weights(weights)
-    interaction_ranking = interpret_pairwise_interactions(w_input, w_later, 1024)
-    interaction_ranking.to_csv(f'feature/score_maps/mlp/{args.cell_type}_interaction_ranking.csv', index=False)
+    ranking = interpret_pairwise_interactions(w_input, w_later, names,
+                                               args.batch_size, args.top_k, args.device)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    ranking.to_csv(args.output, index=False)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

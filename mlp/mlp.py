@@ -13,10 +13,28 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import f1_score
 import scanpy as sc
 import wandb
+import hdf5plugin  # Register the compression filter used by the split files.
+
+
+class ExpressionDataset(Dataset):
+    """Convert individual sparse rows to dense tensors as batches are loaded."""
+
+    def __init__(self, matrix, labels):
+        self.matrix = matrix
+        self.labels = labels.to_numpy(dtype="int64")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        row = self.matrix[index]
+        if hasattr(row, "toarray"):
+            row = row.toarray()
+        return torch.as_tensor(row, dtype=torch.float32), int(self.labels[index])
 
 
 def load_data(data_path: str):
@@ -32,8 +50,7 @@ def load_data(data_path: str):
     label_mapping = {"Not AD": 0, "High": 1}
     y_encoded = y_filtered.map(label_mapping)
 
-    # return list of dense tensors & int labels
-    return list(zip(X_filtered.todense(), y_encoded))
+    return ExpressionDataset(X_filtered, y_encoded)
 
 class MLP(nn.Module):
     """Simple 3-layer MLP for binary cell classification from gene expression.
@@ -119,6 +136,9 @@ def parse_args():
     parser.add_argument("--cell_type", required=True, type=str, help="Target cell‑type tag")
     parser.add_argument("--epochs", default=10, type=int, help="Number of training epochs")
     parser.add_argument("--batch_size", default=128, type=int, help="Mini‑batch size")
+    parser.add_argument("--train_dir", default="data/split_train", type=Path)
+    parser.add_argument("--test_dir", default="data/split_test", type=Path)
+    parser.add_argument("--output_dir", default="output_models/MLP", type=Path)
     return parser.parse_args()
 
 
@@ -133,8 +153,8 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # Dataloaders
-    train_ds = load_data(f"data/split_train/cell_type_{args.cell_type}.h5ad")
-    test_ds = load_data(f"data/split_test/cell_type_{args.cell_type}.h5ad")
+    train_ds = load_data(args.train_dir / f"cell_type_{args.cell_type}.h5ad")
+    test_ds = load_data(args.test_dir / f"cell_type_{args.cell_type}.h5ad")
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
@@ -146,7 +166,7 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     # Training loop
-    out_dir = Path(f"output_models/MLP/{args.cell_type}")
+    out_dir = args.output_dir / args.cell_type
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(args.epochs):

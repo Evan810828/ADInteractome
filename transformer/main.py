@@ -103,6 +103,7 @@ def train(train_dataset, test_dataset, config, args):
         for batch_idx, (batch_sequences, batch_values, batch_labels) in enumerate(train_dataloader): #enumerate(dataloader)
             # Move tensors to GPU
             batch_sequences = batch_sequences.to(device)
+            batch_values = batch_values.to(device)
             batch_labels = batch_labels.to(device)
 
             optimizer.zero_grad()
@@ -116,7 +117,8 @@ def train(train_dataset, test_dataset, config, args):
                 wandb.log({"epoch": epoch, "step": batch_idx, "train_loss": total_loss / (batch_idx+1)})
                 
             if (not args.epoch_wise_test) and batch_idx % args.eval_every == 0 and batch_idx > 0 and epoch > 0:
-                test_loss, acc, f1_value = test(model, test_dataloader, criterion, args.device)
+                test_loss, acc, f1_value, _ = test(model, test_dataloader, criterion, device)
+                model.train()
                 wandb.log({"epoch": epoch, "step": batch_idx, "test_loss": test_loss, "accuracy": acc, "f1_score": f1_value})
                 if f1_value > best_f1:
                     best_f1 = f1_value
@@ -124,7 +126,7 @@ def train(train_dataset, test_dataset, config, args):
                     torch.save(model.state_dict(), f"{args.output}/{wandb.run.name}/epoch_{epoch}_batch_{batch_idx}.pth")
         
         if args.epoch_wise_test:
-            test_loss, acc, f1_value = test(model, test_dataloader, criterion, args.device)
+            test_loss, acc, f1_value, _ = test(model, test_dataloader, criterion, device)
             print({"epoch": epoch, "test_loss": test_loss, "accuracy": acc, "f1_score": f1_value})
             if f1_value > best_f1:
                 best_f1 = f1_value
