@@ -107,33 +107,80 @@ def plot_gsea(pre_res, output_dir, file_name, top_n=5):
             plt.close('all')  # Clean up any open figures
             continue
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="gene-transformer")
-    parser.add_argument("--data_path", type=str, default="evaluation/data", help="Path to the data folder")
-    parser.add_argument("--output", type=str, default="res.csv", help="Path to the output file")
-    parser.add_argument("--plot", action="store_true", help="Generate GSEA enrichment plots")
-    parser.add_argument("--top_n", type=int, default=5, help="Number of top gene sets to plot")
+def plot_bubble_chart(results, output):
+    """Show each cell type and method; colour is NES, size is -log10(p)."""
+    from matplotlib.colors import TwoSlopeNorm
+
+    if results.empty:
+        raise ValueError("No GSEA results available for plotting")
+    data = results.copy()
+    data["NES"] = pd.to_numeric(data["NES"])
+    data["p_value"] = pd.to_numeric(data["p_value"])
+    if ((data["p_value"] <= 0) | (data["p_value"] > 1)).any():
+        raise ValueError("p values must be in (0, 1]")
+    cells = list(dict.fromkeys(data["cell_type"]))
+    methods = list(dict.fromkeys(data["method"]))
+    x = data["method"].map({v: i for i, v in enumerate(methods)})
+    y = data["cell_type"].map({v: i for i, v in enumerate(cells)})
+    sizes = 35 + 110 * -np.log10(data["p_value"])
+    max_abs = max(float(np.abs(data["NES"]).max()), 1e-12)
+    fig, ax = plt.subplots(figsize=(max(5, len(methods) * 2), max(4, len(cells) * .4)))
+    sc = ax.scatter(x, y, c=data["NES"], s=sizes, cmap="coolwarm",
+                    norm=TwoSlopeNorm(vmin=-max_abs, vcenter=0, vmax=max_abs),
+                    edgecolors="black", linewidths=.3)
+    ax.set_xticks(range(len(methods)), methods, rotation=30, ha="right")
+    ax.set_yticks(range(len(cells)), cells)
+    ax.invert_yaxis()
+    ax.set_title("BioGRID GSEA: NES and nominal p-value")
+    fig.colorbar(sc, ax=ax, label="Normalized enrichment score (NES)")
+    for p in (1, .05, .001):
+        ax.scatter([], [], s=35 + 110 * -np.log10(p), color="gray", alpha=.6, label=f"p = {p:g}")
+    ax.legend(title="Nominal p-value", bbox_to_anchor=(1.3, 1), loc="upper left")
+    fig.savefig(output, bbox_inches="tight")
+    plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="BioGRID preranked GSEA")
+    parser.add_argument("--data_path", default="evaluation/data")
+    parser.add_argument("--input_dir", help="Rankings named METHOD__CELLTYPE.csv")
+    parser.add_argument("--reference", help="Gene-set CSV (defaults to filtered_BioGRID.csv)")
+    parser.add_argument("--output", default="res.csv", help="Combined results CSV")
+    parser.add_argument("--bubble", help="Optional NES bubble chart PDF")
+    parser.add_argument("--plot", action="store_true", help="Generate individual enrichment plots")
+    parser.add_argument("--top_n", type=int, default=5)
     args = parser.parse_args()
-    
-    for root, dirs, files in os.walk(os.path.join(args.data_path, "input")):
-        for file in files:
-            try:
-                # Load data
-                BioGRID = custom_gene_set(os.path.join(args.data_path, 'BioGRID.csv')) # Gene-Gene Interactions from BioGRID
-                BioGRID_Strong = custom_gene_set(os.path.join(args.data_path,  'filtered_BioGRID.csv')) 
-                DisGeNET_All = custom_gene_set(os.path.join(args.data_path, 'DisGeNET_GDA_0.csv')) # AD-related genes from DisGeNET (score_gda>0)
-                DisGeNET_Strong = custom_gene_set(os.path.join(args.data_path,  'DisGeNET_GDA_01.csv')) # AD-related genes from DisGeNET (score_gda>0.1)
-                rnk = ranking_list(os.path.join(args.data_path, "input", file)) # The ranking list of gene-gene interactions
-                # GSEA
-                res_gsea, pre_res = run_gsea(rnk, {**BioGRID_Strong})
-                res_gsea.to_csv(os.path.join(args.data_path, "output", f"res_{file}"), index=False)
-                
-                # Generate plots if requested
-                if args.plot:
-                    plot_dir = os.path.join(args.data_path, "plots")
-                    plot_gsea(pre_res, plot_dir, file, top_n=args.top_n)
-                    
-            except Exception as e:
-                print(f"Error processing file {file}: {e}")
-                continue
-            
+    input_dir = args.input_dir or os.path.join(args.data_path, "input")
+    reference = args.reference or os.path.join(args.data_path, "filtered_BioGRID.csv")
+    filenames = sorted(f for f in os.listdir(input_dir) if f.endswith(".csv"))
+    if not filenames:
+        raise ValueError(f"No ranking CSV files in {input_dir}")
+    gene_set = custom_gene_set(reference)
+    results = []
+    for filename in filenames:
+        stem = os.path.splitext(filename)[0]
+        if "__" not in stem:
+            raise ValueError(f"Expected METHOD__CELLTYPE.csv, got {filename}")
+        method, cell_type = stem.split("__", 1)
+        if not method or not cell_type:
+            raise ValueError(f"Expected METHOD__CELLTYPE.csv, got {filename}")
+        res, pre_res = run_gsea(ranking_list(os.path.join(input_dir, filename)), gene_set)
+        res.insert(0, "cell_type", cell_type)
+        res.insert(0, "method", method)
+        res.insert(2, "ranking_file", filename)
+        results.append(res)
+        if args.plot:
+            plot_gsea(pre_res, os.path.join(args.data_path, "plots"), filename, args.top_n)
+    combined = pd.concat(results, ignore_index=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    combined.to_csv(args.output, index=False)
+    if args.bubble:
+        if combined["gene_set"].nunique() != 1:
+            raise ValueError("Bubble chart requires exactly one reference gene set")
+        os.makedirs(os.path.dirname(os.path.abspath(args.bubble)), exist_ok=True)
+        plot_bubble_chart(combined, args.bubble)
+    print(f"Wrote {len(combined)} GSEA results to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-import scanpy as sc
+import anndata as ad
+import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import f1_score
 import wandb
@@ -26,7 +27,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from transformer.celluformer import CelluFormer
-from transformer.dataset import VariableLengthSequenceDataset
+from transformer.dataset import LazyGlobalPaddedDataset
 from utils import setup_seed, load_checkpoint
     
 def init(JSON_PATH):
@@ -60,23 +61,22 @@ def load_data(data_path, is_test):
         Tuple of (train_dataset, test_dataset).
     """
     print("Loading data...")
-    data_cell = sc.read_h5ad(data_path)
-
-    filtered_data = data_cell[data_cell.obs['Overall AD neuropathological Change'].isin(['Not AD', 'High'])]
-    X_filtered = filtered_data.X
-    y_filtered = filtered_data.obs['Overall AD neuropathological Change']
-    label_mapping = {'Not AD': 0, 'High': 1}
-    y_encoded = y_filtered.map(label_mapping)
-    
-    X_train, X_test, y_train, y_test = train_test_split(X_filtered, y_encoded, test_size=0.2, random_state=42)
-    
-    if (not is_test):
-        train_dataset = VariableLengthSequenceDataset(X_train, y_train)
-    else:
-        train_dataset = None
-        
-    test_dataset = VariableLengthSequenceDataset(X_test, y_test)
-    
+    # Avoid loading every h5ad layer and avoid extra copies of X per split.
+    # The index-based split produces exactly the same permutation as splitting
+    # the filtered matrix and labels directly.
+    data_cell = ad.read_h5ad(data_path, backed="r")
+    try:
+        classes = data_cell.obs['Overall AD neuropathological Change']
+        rows = np.flatnonzero(classes.isin(['Not AD', 'High']).to_numpy())
+        labels = classes.iloc[rows].map({'Not AD': 0, 'High': 1}).to_numpy(dtype=np.int64)
+        train_pos, test_pos = train_test_split(np.arange(len(rows)), test_size=0.2, random_state=42)
+        X = data_cell.X.to_memory()
+    finally:
+        data_cell.file.close()
+    if getattr(X, "format", None) != "csr":
+        X = X.tocsr()
+    train_dataset = None if is_test else LazyGlobalPaddedDataset(X, rows[train_pos], labels[train_pos])
+    test_dataset = LazyGlobalPaddedDataset(X, rows[test_pos], labels[test_pos])
     return train_dataset, test_dataset
 
 def train(train_dataset, test_dataset, config, args):
