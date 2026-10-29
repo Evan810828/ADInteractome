@@ -23,6 +23,7 @@ import json
 import argparse
 import hdf5plugin
 import sys
+import hashlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -107,6 +108,37 @@ def load_data(data_path, is_test):
     test_dataset = LazyGlobalPaddedDataset(X, test_rows, test_labels)
     return train_dataset, test_dataset
 
+def _data_signature(dataset):
+    """Identify the selected rows and labels used by the real training dataset."""
+    digest = hashlib.sha256()
+    digest.update(str(len(dataset)).encode())
+    for name in ("rows", "labels"):
+        value = getattr(dataset, name, None)
+        if value is not None:
+            if torch.is_tensor(value):
+                value = value.detach().cpu().numpy()
+            digest.update(np.asarray(value).tobytes())
+    digest.update(str(getattr(dataset, "max_length", None)).encode())
+    return digest.hexdigest()
+
+
+def _file_identity(path):
+    path = os.path.realpath(path)
+    st = os.stat(path)
+    return {"path": path, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _save_recovery(path, state):
+    """Publish a complete checkpoint atomically; leave the previous one on failure."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "wb") as f:
+        torch.save(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, path)
+
+
 def train(train_dataset, test_dataset, config, args):
     """Train the CelluFormer model with periodic evaluation and checkpointing."""
     train_dataloader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle = True)
@@ -122,13 +154,68 @@ def train(train_dataset, test_dataset, config, args):
     model = model.to(device)
     
     best_f1 = 0.0
-    
-    for epoch in range(args.epochs):
+    best_checkpoint_path = None
+    start_epoch, next_batch, total_loss = 0, 0, 0.0
+    resume = None
+    run_dir = os.path.join(args.output, wandb.run.name)
+    os.makedirs(run_dir, exist_ok=True)
+    recovery_path = args.recovery_path or os.path.join(run_dir, "recovery_latest.pt")
+    identity = {"config": config, "data": _file_identity(args.data),
+                "train": _data_signature(train_dataset), "test": _data_signature(test_dataset),
+                "eval_every": args.eval_every, "epoch_wise_test": args.epoch_wise_test}
+    if args.resume_checkpoint:
+        resume = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+        if resume["identity"] != identity:
+            raise ValueError("Recovery checkpoint does not match data, split, configuration or evaluation settings")
+        model.load_state_dict(resume["model"])
+        optimizer.load_state_dict(resume["optimizer"])
+        start_epoch, next_batch = resume["epoch"], resume["next_batch"]
+        total_loss, best_f1 = resume["total_loss"], resume["best_f1"]
+        best_checkpoint_path = resume["best_checkpoint_path"]
+        if best_checkpoint_path is not None and not os.path.isfile(best_checkpoint_path):
+            raise FileNotFoundError(f"Best inference checkpoint is missing: {best_checkpoint_path}")
+        torch.set_rng_state(resume["cpu_rng"])
+        if torch.cuda.is_available():
+            if resume["cuda_rng"] is None:
+                raise ValueError("Cannot exactly resume a CPU checkpoint on CUDA")
+            torch.cuda.set_rng_state_all(resume["cuda_rng"])
+        elif resume["cuda_rng"] is not None:
+            raise ValueError("Cannot exactly resume a CUDA checkpoint on CPU")
+        print(f"Resuming epoch {start_epoch}, batch {next_batch} from {args.resume_checkpoint}")
+
+    def save_recovery(epoch, next_batch, loss, epoch_rng):
+        _save_recovery(recovery_path, {
+            "version": 1, "identity": identity, "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(), "epoch": epoch, "next_batch": next_batch,
+            "total_loss": loss, "best_f1": best_f1, "best_checkpoint_path": best_checkpoint_path,
+            "epoch_rng": epoch_rng,
+            "cpu_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        })
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        total_loss = 0.0
+        if epoch != start_epoch or resume is None:
+            total_loss = 0.0
+            next_batch = 0
         test_loss, acc, f1_value = 0, 0, 0
 
-        for batch_idx, (batch_sequences, batch_values, batch_labels) in enumerate(train_dataloader): #enumerate(dataloader)
+        # Recreate the original shuffled iterator, then restore checkpoint RNG
+        # after skipping consumed batches. The current dataset is deterministic
+        # and DataLoader uses num_workers=0; dropout must not be replayed.
+        if resume is not None and epoch == start_epoch and next_batch:
+            epoch_rng = resume["epoch_rng"]
+            checkpoint_cpu_rng = torch.get_rng_state()
+            torch.set_rng_state(epoch_rng)
+            iterator = iter(train_dataloader)
+            for _ in range(next_batch):
+                next(iterator)
+            torch.set_rng_state(checkpoint_cpu_rng)
+        else:
+            epoch_rng = torch.get_rng_state()
+            iterator = iter(train_dataloader)
+
+        for batch_idx, (batch_sequences, batch_values, batch_labels) in enumerate(iterator, start=next_batch):
             # Move tensors to GPU
             batch_sequences = batch_sequences.to(device)
             batch_values = batch_values.to(device)
@@ -150,17 +237,24 @@ def train(train_dataset, test_dataset, config, args):
                 wandb.log({"epoch": epoch, "step": batch_idx, "test_loss": test_loss, "accuracy": acc, "f1_score": f1_value})
                 if f1_value > best_f1:
                     best_f1 = f1_value
-                    print(f"    Model saved to {args.output}/{wandb.run.name}/epoch_{epoch}_batch_{batch_idx}.pth")
-                    torch.save(model.state_dict(), f"{args.output}/{wandb.run.name}/epoch_{epoch}_batch_{batch_idx}.pth")
+                    best_checkpoint_path = os.path.abspath(os.path.join(run_dir, f"epoch_{epoch}_batch_{batch_idx}.pth"))
+                    print(f"    Model saved to {best_checkpoint_path}")
+                    torch.save(model.state_dict(), best_checkpoint_path)
+
+            if args.checkpoint_every > 0 and (batch_idx + 1) % args.checkpoint_every == 0 and batch_idx + 1 < len(train_dataloader):
+                save_recovery(epoch, batch_idx + 1, total_loss, epoch_rng)
         
         if args.epoch_wise_test:
             test_loss, acc, f1_value, _ = test(model, test_dataloader, criterion, device)
             print({"epoch": epoch, "test_loss": test_loss, "accuracy": acc, "f1_score": f1_value})
             if f1_value > best_f1:
                 best_f1 = f1_value
-                print(f"    Model saved to {args.output}/{wandb.run.name}/epoch_{epoch}_batch_{batch_idx}.pth")
-                torch.save(model.state_dict(), f"{args.output}/{wandb.run.name}/epoch_{epoch}_batch_{batch_idx}.pth")
-                    
+                best_checkpoint_path = os.path.abspath(os.path.join(run_dir, f"epoch_{epoch}_batch_{batch_idx}.pth"))
+                print(f"    Model saved to {best_checkpoint_path}")
+                torch.save(model.state_dict(), best_checkpoint_path)
+        save_recovery(epoch + 1, 0, 0.0, None)
+        resume = None
+    print(f"Best inference checkpoint: {best_checkpoint_path} (weighted F1: {best_f1})")
     return
 
 
@@ -221,6 +315,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default="model.pth", help="Path to the model")
     parser.add_argument("--epoch_wise_test", type=bool, default=False, help="Test the model after each epoch")
     parser.add_argument("--train_loss_log", type=int, default=50, help="Log the train loss every n steps")
+    parser.add_argument("--checkpoint_every", type=int, default=250, help="Save resumable state every N batches; 0 disables intra-epoch saves")
+    parser.add_argument("--recovery_path", type=str, default=None, help="Path for the latest resumable training checkpoint")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Resume training from a recovery checkpoint")
     args = parser.parse_args()
     
     setup_seed(42)
