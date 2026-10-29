@@ -29,6 +29,31 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from transformer.celluformer import CelluFormer
 from transformer.dataset import LazyGlobalPaddedDataset
 from utils import setup_seed, load_checkpoint
+
+# Subclass names are the exact values in SEA-AD's obs["Subclass"].
+NEURONAL_SUBCLASSES = (
+    "Chandelier", "L2/3 IT", "L4 IT", "L5 ET", "L5 IT", "L5/6 NP",
+    "L6 IT", "L6 CT", "L6b", "L6 IT Car3", "Lamp5", "Pax6", "Vip",
+    "Sst Chodl", "Sst", "Pvalb", "Lamp5 Lhx6", "Sncg",
+)
+
+
+def select_neuronal_split(obs):
+    """Split all eligible cells first, then retain the 18 neuronal subclasses.
+
+    This preserves the per-cell train/test assignment used by split_cell_type.py
+    and hence by the per-subclass MLP models.
+    """
+    classes = obs['Overall AD neuropathological Change']
+    rows = np.flatnonzero(classes.isin(['Not AD', 'High']).to_numpy())
+    labels = classes.iloc[rows].map({'Not AD': 0, 'High': 1}).to_numpy(dtype=np.int64)
+    train_pos, test_pos = train_test_split(np.arange(len(rows)), test_size=0.2, random_state=42)
+    is_neuronal = obs['Subclass'].iloc[rows].isin(NEURONAL_SUBCLASSES).to_numpy()
+    train_pos = train_pos[is_neuronal[train_pos]]
+    test_pos = test_pos[is_neuronal[test_pos]]
+    if not len(train_pos) or not len(test_pos):
+        raise ValueError('No neuronal cells in one or both train/test splits')
+    return rows[train_pos], rows[test_pos], labels[train_pos], labels[test_pos]
     
 def init(JSON_PATH):
     """Initialize wandb and load hyperparameters from a JSON config file."""
@@ -66,17 +91,20 @@ def load_data(data_path, is_test):
     # the filtered matrix and labels directly.
     data_cell = ad.read_h5ad(data_path, backed="r")
     try:
-        classes = data_cell.obs['Overall AD neuropathological Change']
-        rows = np.flatnonzero(classes.isin(['Not AD', 'High']).to_numpy())
-        labels = classes.iloc[rows].map({'Not AD': 0, 'High': 1}).to_numpy(dtype=np.int64)
-        train_pos, test_pos = train_test_split(np.arange(len(rows)), test_size=0.2, random_state=42)
+        train_rows, test_rows, train_labels, test_labels = select_neuronal_split(data_cell.obs)
+        print(f"Neuronal cells: {len(train_rows)} train, {len(test_rows)} test", flush=True)
+        print("Subclass counts (train / test):", flush=True)
+        for subclass in NEURONAL_SUBCLASSES:
+            counts = (int((data_cell.obs['Subclass'].iloc[train_rows] == subclass).sum()),
+                      int((data_cell.obs['Subclass'].iloc[test_rows] == subclass).sum()))
+            print(f"  {subclass}: {counts[0]} / {counts[1]}", flush=True)
         X = data_cell.X.to_memory()
     finally:
         data_cell.file.close()
     if getattr(X, "format", None) != "csr":
         X = X.tocsr()
-    train_dataset = None if is_test else LazyGlobalPaddedDataset(X, rows[train_pos], labels[train_pos])
-    test_dataset = LazyGlobalPaddedDataset(X, rows[test_pos], labels[test_pos])
+    train_dataset = None if is_test else LazyGlobalPaddedDataset(X, train_rows, train_labels)
+    test_dataset = LazyGlobalPaddedDataset(X, test_rows, test_labels)
     return train_dataset, test_dataset
 
 def train(train_dataset, test_dataset, config, args):
