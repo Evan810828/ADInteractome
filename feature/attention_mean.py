@@ -43,13 +43,24 @@ def load_data(data_path):
     return dataset
 
 
-def compute_selfattention(encoder, x, layer, d_model, num_heads, logit_scale):
-    """Use the QKV layout and optional logit multiplier of the reference script."""
+def compute_selfattention(encoder, x, layer, d_model, num_heads, logit_scale,
+                          query_block_size):
+    """Yield query blocks using the reference QKV layout and logit multiplier.
+
+    Each query is normalized over the complete key sequence, exactly as in the
+    full attention matrix. Only the query dimension is partitioned.
+    """
+    if query_block_size <= 0:
+        raise ValueError("query_block_size must be positive")
     attention = encoder.layers[layer].self_attn
     h = F.linear(x, attention.in_proj_weight, bias=attention.in_proj_bias)
     qkv = h.reshape(x.shape[0], x.shape[1], num_heads, 3 * d_model // num_heads)
     q, k, _ = qkv.permute(0, 2, 1, 3).chunk(3, dim=-1)
-    return F.softmax((q @ k.transpose(-2, -1)) * logit_scale / math.sqrt(q.size(-1)), dim=-1)
+    kt = k.transpose(-2, -1)
+    for start in range(0, x.shape[1], query_block_size):
+        stop = min(start + query_block_size, x.shape[1])
+        logits = (q[:, :, start:stop] @ kt) * logit_scale / math.sqrt(q.size(-1))
+        yield start, stop, F.softmax(logits, dim=-1)
 
 
 def compute_rank(model, dataset, config, args):
@@ -78,10 +89,11 @@ def compute_rank(model, dataset, config, args):
                 h = embedded_X.clone()
                 if norm_first:
                     h = transformer_encoder.layers[i].norm1(h)
-                attn_probs = compute_selfattention(
-                    transformer_encoder, h, i, d_model, num_heads, args.logit_scale
-                )
-                E_attn += attn_probs.sum(dim=1)[0]
+                for start, stop, attn_probs in compute_selfattention(
+                    transformer_encoder, h, i, d_model, num_heads,
+                    args.logit_scale, args.query_block_size
+                ):
+                    E_attn[start:stop] += attn_probs.sum(dim=1)[0]
 
             E_attn /= num_layers * num_heads
 
@@ -111,6 +123,8 @@ if __name__ == '__main__':
     parser.add_argument("--output", type=str, default="feature/score_maps/adjust/score_map_cell_type_Lamp5_Lhx6_adjusted.pkl", help="Path to the output file")
     parser.add_argument("--logit_scale", type=float, choices=[1.0, 1000.0], default=1000.0,
                         help="Attention-logit multiplier: 1000 follows temp.py; 1 follows utils.py")
+    parser.add_argument("--query_block_size", type=int, default=256,
+                        help="Queries per attention block; softmax still covers every key")
     args = parser.parse_args()
     
     setup_seed(42)
