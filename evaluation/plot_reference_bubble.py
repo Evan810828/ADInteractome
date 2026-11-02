@@ -27,7 +27,7 @@ METHODS = {
     "Lens-MLP": ("Lens-MLP (2026 test)", "#EDC948"),
     "CelluFormer": ("ADInteractome-CelluFormer (2026 train)", "#274A93"),
     "MLP": ("ADInteractome-MLP (2026 train)", "#1B7045"),
-    "cscore_2026": ("CS-CORE (2026 train)", "#A75B00"),
+    "cscore_2026": ("CS-CORE (2026 train; UMI)", "#A75B00"),
     "pearson_2026": ("Pearson (2026 train)", "#A1262F"),
 }
 REFERENCE_METHODS = ("Lens-CelluFormer", "Lens-MLP")
@@ -54,6 +54,10 @@ def assemble(reference_path, reproduction_path, additional_path=None):
             raise ValueError("Additional results must contain only 2026 CS-CORE/Pearson")
         if not additional["gene_set"].isin(("BioGRID", "filtered_BioGRID")).all():
             raise ValueError("Unexpected additional gene set")
+        cscore_rows = additional["method"] == "cscore_2026"
+        if cscore_rows.any():
+            if "input_type" not in additional or not additional.loc[cscore_rows, "input_type"].eq("UMI").all():
+                raise ValueError("2026 CS-CORE results require input_type=UMI for every row")
         additional["gene_percentage"] = pd.to_numeric(additional["gene %"].astype(str).str.rstrip("%"))
         additional["split"], additional["status"], additional["gene_set"] = "train", "ok", "filtered_BioGRID"
         pieces.append(additional[columns])
@@ -73,6 +77,7 @@ def assemble(reference_path, reproduction_path, additional_path=None):
     if ((frame.loc[finite, "gene_percentage"] < 0) | (frame.loc[finite, "gene_percentage"] > 100)).any():
         raise ValueError("Gene percentages must be in [0, 100]")
     frame["method_label"] = frame["method"].map(lambda x: METHODS[x][0])
+    frame["input_type"] = np.where(frame["method"] == "cscore_2026", "UMI", "not specified")
     frame["source"] = np.where(frame["split"] == "train", "SEA-AD 2026 train; reproduction",
                                "SEA-AD 2026 test; Lens reference")
     return frame
@@ -124,9 +129,12 @@ def plot(frame, pdf_path):
                                     markerfacecolor="white", markeredgecolor="black", label=f"{v}%") for v in (10, 30)]
         ax.legend(handles=percentage_handles, title="Gene Percentage", loc="lower left", bbox_to_anchor=(1.1, .08),
                   fontsize=10, title_fontsize=12, labelspacing=1.4, borderpad=1.0)
+        cscore_note = ("CS-CORE: raw UMI counts; 5,000 genes selected using normalized expression.\n"
+                       if "cscore_2026" in methods else "")
         fig.text(.12, .04,
                  "2026 train: new reproduction; CelluFormer checkpoint is epoch 2, batch 13000.\n"
                  "Lens: pair atoms only; 2026 test cells and expression-based candidates.\n"
+                 + cscore_note +
                  "Splits and candidate universes differ; direct numerical comparisons require care. NA denotes unavailable NES.",
                  fontsize=8, ha="left", va="bottom", linespacing=1.5)
         fig.subplots_adjust(left=.12, right=.67, top=.91, bottom=.14)
