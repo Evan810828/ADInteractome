@@ -1,8 +1,8 @@
 """Plot the 2026 reproduction alongside available reference baselines.
 
-Lens and historical values are read from the table used for the supplied
-reference figure; the 2026 reproduction values are read from gsea.csv.
-These inputs have different data releases, splits and candidate universes.
+Lens values are read from the table used for the supplied reference figure;
+the 2026 reproduction values are read from gsea.csv. These inputs have
+different splits and candidate universes.
 """
 
 import argparse
@@ -27,14 +27,10 @@ METHODS = {
     "Lens-MLP": ("Lens-MLP (2026 test)", "#EDC948"),
     "CelluFormer": ("ADInteractome-CelluFormer (2026 train)", "#274A93"),
     "MLP": ("ADInteractome-MLP (2026 train)", "#1B7045"),
-    "ADInteractome-CelluFormer": ("ADInteractome-CelluFormer (2024 historical)", "#4E79A7"),
-    "ADInteractome-MLP": ("ADInteractome-MLP (2024 historical)", "#59A14F"),
-    "cscore": ("CS-CORE (2024 historical)", "#F28E2B"),
-    "pearson": ("Pearson (2024 historical)", "#E15759"),
     "cscore_2026": ("CS-CORE (2026 train)", "#A75B00"),
     "pearson_2026": ("Pearson (2026 train)", "#A1262F"),
 }
-REFERENCE_METHODS = tuple(k for k in METHODS if k not in ("CelluFormer", "MLP", "cscore_2026", "pearson_2026"))
+REFERENCE_METHODS = ("Lens-CelluFormer", "Lens-MLP")
 
 
 def assemble(reference_path, reproduction_path, additional_path=None):
@@ -77,8 +73,8 @@ def assemble(reference_path, reproduction_path, additional_path=None):
     if ((frame.loc[finite, "gene_percentage"] < 0) | (frame.loc[finite, "gene_percentage"] > 100)).any():
         raise ValueError("Gene percentages must be in [0, 100]")
     frame["method_label"] = frame["method"].map(lambda x: METHODS[x][0])
-    frame["source"] = np.where(frame["split"] == "train", "SEA-AD 2026 train; reproduction", np.where(
-        frame["split"] == "test", "SEA-AD 2026 test; Lens reference", "SEA-AD 2024 historical"))
+    frame["source"] = np.where(frame["split"] == "train", "SEA-AD 2026 train; reproduction",
+                               "SEA-AD 2026 test; Lens reference")
     return frame
 
 
@@ -130,8 +126,8 @@ def plot(frame, pdf_path):
                   fontsize=10, title_fontsize=12, labelspacing=1.4, borderpad=1.0)
         fig.text(.12, .04,
                  "2026 train: new reproduction; CelluFormer checkpoint is epoch 2, batch 13000.\n"
-                 "Lens: pair atoms only; 2026 test cells and expression-based candidates. Historical: archived 2024 results.\n"
-                 "Data releases, splits and candidate universes differ; direct numerical comparisons require care. NA denotes unavailable NES.",
+                 "Lens: pair atoms only; 2026 test cells and expression-based candidates.\n"
+                 "Splits and candidate universes differ; direct numerical comparisons require care. NA denotes unavailable NES.",
                  fontsize=8, ha="left", va="bottom", linespacing=1.5)
         fig.subplots_adjust(left=.12, right=.67, top=.91, bottom=.14)
         fig.savefig(pdf_path, metadata={"Title": "filtered_BioGRID enrichment: reproduction and baselines"})
