@@ -88,7 +88,8 @@ def compute_rank(model, dataset, config, args):
             seq, vals, _ = next(iterator)
             sampling_prob = torch.ones(1)
         
-        seq = seq.to(args.device) - 1
+        # Keep the dataset's 1-based tokens for the trained embedding table.
+        seq = seq.to(args.device)
         vals = vals.to(args.device)
         
         E_attn = torch.zeros((seq.shape[1], seq.shape[1]))
@@ -116,20 +117,22 @@ def compute_rank(model, dataset, config, args):
         E_attn = E_attn / (num_layers * attn_probs.shape[1])
         
         # compute score
+        # Aggregation runs on CPU and uses 0-based gene indices.
+        gene_indices = seq[0].cpu() - 1
         index_map = torch.zeros((36601, seq.shape[1]))
-        index_map[seq[0]] = seq[0].float().cpu()
+        index_map[gene_indices] = gene_indices.float()
         
         res = E_attn.sum(0)
         value_map = torch.zeros((36601, seq.shape[1]))
-        value_map[seq[0], :] = res.cpu()
+        value_map[gene_indices, :] = res.cpu()
         value_map = value_map * sampling_prob
             
         score_map.scatter_add_(1, index_map.long(), value_map.to(torch.float32))
         
         # compute frequency
-        frequency_block = torch.ones(seq[0].shape[0], seq[0].shape[0])
+        frequency_block = torch.ones(gene_indices.shape[0], gene_indices.shape[0])
         value_map = torch.zeros((36601, seq.shape[1]))
-        value_map[seq[0], :] = frequency_block
+        value_map[gene_indices, :] = frequency_block
         value_map = value_map * sampling_prob
             
         frequency_map.scatter_add_(1, index_map.long(), value_map.to(torch.float32))

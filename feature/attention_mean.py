@@ -74,7 +74,8 @@ def compute_rank(model, dataset, config, args):
     
     for seq, vals, _ in tqdm(dataloader, desc="Computing rank"):
         
-        seq = seq.to(args.device) - 1
+        # Keep the dataset's 1-based tokens for the trained embedding table.
+        seq = seq.to(args.device)
         vals = vals.to(args.device)
         
         E_attn = torch.zeros((seq.shape[1], seq.shape[1])).to(args.device)
@@ -97,18 +98,19 @@ def compute_rank(model, dataset, config, args):
 
             E_attn /= num_layers * num_heads
 
-            # Match the reference scatter operation: each distinct source row
-            # receives the same column-summed attention; repeated indices in
-            # the padded sequence contribute repeatedly to destination columns.
-            index_map = torch.zeros((config['num_genes'], seq.shape[1]), device=args.device)
-            index_map[seq[0]] = seq[0].float()
-            value_map = torch.zeros_like(index_map)
-            value_map[seq[0], :] = E_attn.sum(0).float()
-            score_map.scatter_add_(1, index_map.long(), value_map)
-
-            value_map.zero_()
-            value_map[seq[0], :] = 1.0
-            frequency_map.scatter_add_(1, index_map.long(), value_map)
+            # Only score-map indices are 0-based; embedding tokens stay 1-based.
+            gene_indices = seq[0] - 1
+            # Every distinct source gene receives the same column sums. Fold
+            # repeated padding destinations before updating those rows, avoiding
+            # three dense (num_genes, sequence_length) scatter buffers.
+            genes, inverse, counts = torch.unique(
+                gene_indices, return_inverse=True, return_counts=True
+            )
+            column_scores = torch.zeros(genes.numel(), device=args.device)
+            column_scores.scatter_add_(0, inverse, E_attn.sum(0).float())
+            rows, columns = genes[:, None], genes[None, :]
+            score_map[rows, columns] += column_scores[None, :]
+            frequency_map[rows, columns] += counts[None, :].float()
             frequency_map += 1e-5
 
     return (score_map / frequency_map).cpu().numpy()
