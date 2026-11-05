@@ -12,7 +12,10 @@ Example usage:
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# Official ADInteractome repository (Evan810828/ADInteractome @ 4344f0e); the only change in this copy is
+# model.emb(seq + 1) in compute_rank, matching the index used in training.
+sys.path.insert(0, os.environ.get('ADINTERACTOME_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                    '..', 'external', 'ADInteractome')))
 
 import torch
 import pickle
@@ -74,14 +77,13 @@ def compute_rank(model, dataset, config, args):
     
     for seq, vals, _ in tqdm(dataloader, desc="Computing rank"):
         
-        # Keep the dataset's 1-based tokens for the trained embedding table.
-        seq = seq.to(args.device)
+        seq = seq.to(args.device) - 1
         vals = vals.to(args.device)
         
         E_attn = torch.zeros((seq.shape[1], seq.shape[1])).to(args.device)
         
         with torch.no_grad():
-            embedded_X = model.emb(seq) * vals.unsqueeze(2)
+            embedded_X = model.emb(seq + 1) * vals.unsqueeze(2)  # FIX: training embeds gene g with row g+1
             num_layers = transformer_encoder.num_layers
             d_model = transformer_encoder.layers[0].self_attn.embed_dim
             num_heads = transformer_encoder.layers[0].self_attn.num_heads
@@ -98,19 +100,18 @@ def compute_rank(model, dataset, config, args):
 
             E_attn /= num_layers * num_heads
 
-            # Only score-map indices are 0-based; embedding tokens stay 1-based.
-            gene_indices = seq[0] - 1
-            # Every distinct source gene receives the same column sums. Fold
-            # repeated padding destinations before updating those rows, avoiding
-            # three dense (num_genes, sequence_length) scatter buffers.
-            genes, inverse, counts = torch.unique(
-                gene_indices, return_inverse=True, return_counts=True
-            )
-            column_scores = torch.zeros(genes.numel(), device=args.device)
-            column_scores.scatter_add_(0, inverse, E_attn.sum(0).float())
-            rows, columns = genes[:, None], genes[None, :]
-            score_map[rows, columns] += column_scores[None, :]
-            frequency_map[rows, columns] += counts[None, :].float()
+            # Match the reference scatter operation: each distinct source row
+            # receives the same column-summed attention; repeated indices in
+            # the padded sequence contribute repeatedly to destination columns.
+            index_map = torch.zeros((config['num_genes'], seq.shape[1]), device=args.device)
+            index_map[seq[0]] = seq[0].float()
+            value_map = torch.zeros_like(index_map)
+            value_map[seq[0], :] = E_attn.sum(0).float()
+            score_map.scatter_add_(1, index_map.long(), value_map)
+
+            value_map.zero_()
+            value_map[seq[0], :] = 1.0
+            frequency_map.scatter_add_(1, index_map.long(), value_map)
             frequency_map += 1e-5
 
     return (score_map / frequency_map).cpu().numpy()
